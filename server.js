@@ -1,6 +1,6 @@
 const { WebSocketServer } = require('ws');
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const ALLOWED_SIZES = [2, 3, 4];
 const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const SUITS = ['S', 'H', 'D', 'C'];
