@@ -360,8 +360,8 @@ wss.on('connection', ws => {
           break;
         }
 
-        if (rank === '2') stackPenalty(room, '2', 2);
-        else if (rank === '3') stackPenalty(room, '3', 3);
+          if (rank === '2') stackPenalty(room, '2', 2 * cards.length);
+          else if (rank === '3') stackPenalty(room, '3', 3 * cards.length);
         else { room.pendingPenalty = 0; room.pendingPenaltyRank = null; }
         room.declaredSuit = null;
 
