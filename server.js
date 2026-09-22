@@ -254,7 +254,12 @@ wss.on('connection', ws => {
     const name = String(msg.name || '').trim().slice(0, 20);
 
     switch (msg.type) {
-      case 'create': {
+      case 'addBot': {
+      if (ws.room == null) return err(ws, 'You are not in a room');
+      addBot(ws.room);
+      break;
+    }
+    case 'create': {
         if (ws.room) return err(ws, 'You are already in a room');
         if (!name) return err(ws, 'Enter your name');
         const max = Number(msg.max);
@@ -444,4 +449,84 @@ function sendGameAndArm(room) {
   sendGame(room);
   if (room.winner) disarmTurn(room);
   else armTurn(room);
+}
+
+// ---- Kadi Bot: a fake player that joins on request and plays like a human ----
+function addBot(room) {
+  if (room.started || room.players.length >= room.max) return false;
+  let botNum = 1;
+  while (room.players.some(p => p.name === 'Kadi Bot' + (botNum > 1 ? ' ' + botNum : ''))) botNum++;
+  const botName = 'Kadi Bot' + (botNum > 1 ? ' ' + botNum : '');
+  const botWs = { isBot: true, sent: [] };
+  botWs.send = (raw) => {
+    try {
+      const m = JSON.parse(raw);
+      if (m.type === 'game') scheduleBotMove(room, botWs, m);
+    } catch (e) {}
+  };
+  room.players.push({ name: botName, ws: botWs });
+  broadcast(room);
+  startIfFull(room);
+  return true;
+}
+
+function scheduleBotMove(room, botWs, state) {
+  if (room.winner || !room.started) return;
+  const me = room.players.find(p => p.ws === botWs);
+  if (!me || state.turn !== me.name) return;
+  const delay = 1000 + Math.random() * 2000;
+  setTimeout(() => {
+    if (room.winner || !room.started) return;
+    if (room.players[room.turn] !== me) return;
+    const top = room.pile[room.pile.length - 1];
+    let choice = null;
+    for (const c of me.hand) {
+      if (canPlayServer(room, c, top)) { choice = c; break; }
+    }
+    if (choice) {
+      const others = me.hand.filter(c => c !== choice && rank(c) === rank(choice));
+      if (others.length) {
+        botPlayGroup(room, me, [choice, ...others]);
+      } else {
+        botPlay(room, me, choice, rank(choice) === 'A' ? suitOf(me.hand.find(c => c !== choice)) || 'H' : null);
+      }
+    } else {
+      botDraw(room, me);
+    }
+  }, delay);
+}
+
+function botPlay(room, me, card, chosenSuit) {
+  const idx = me.hand.indexOf(card);
+  if (idx === -1) return;
+  me.hand.splice(idx, 1);
+  room.pile.push(card);
+  if (rank(card) === 'A' && chosenSuit) room.declaredSuit = chosenSuit; else room.declaredSuit = null;
+  if (rank(card) === '2' || rank(card) === '3') stackPenalty(room, rank(card), rank(card) === '2' ? 2 : 3);
+  if (checkWin(room, me, rank(card))) { sendGame(room); return; }
+  nextTurn(room);
+  sendGame(room);
+}
+
+function botPlayGroup(room, me, cards) {
+  for (const c of cards) {
+    const idx = me.hand.indexOf(c);
+    if (idx !== -1) { me.hand.splice(idx, 1); room.pile.push(c); }
+  }
+  const last = cards[cards.length - 1];
+  if (rank(last) === '2' || rank(last) === '3') stackPenalty(room, rank(last), (rank(last) === '2' ? 2 : 3) * cards.length);
+  if (checkWin(room, me, rank(last))) { sendGame(room); return; }
+  nextTurn(room);
+  sendGame(room);
+}
+
+function botDraw(room, me) {
+  if (room.pendingPenalty > 0) {
+    for (let i = 0; i < room.pendingPenalty; i++) { const c = drawOneCard(room); if (c) me.hand.push(c); }
+    room.pendingPenalty = 0; room.pendingPenaltyRank = null;
+  } else {
+    const c = drawOneCard(room); if (c) me.hand.push(c);
+  }
+  nextTurn(room);
+  sendGame(room);
 }
