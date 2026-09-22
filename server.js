@@ -473,7 +473,7 @@ function addBot(room) {
 function scheduleBotMove(room, botWs, state) {
   if (room.winner || !room.started) return;
   const me = room.players.find(p => p.ws === botWs);
-  if (!me || room.players[state.turn] !== me) return;
+  if (!me || state.turn !== me.name) return;
   const delay = 1000 + Math.random() * 2000;
   setTimeout(() => {
     if (room.winner || !room.started) return;
