@@ -503,9 +503,9 @@ function botPlay(room, me, card, chosenSuit) {
   room.pile.push(card);
   if (rank(card) === 'A' && chosenSuit) room.declaredSuit = chosenSuit; else room.declaredSuit = null;
   if (rank(card) === '2' || rank(card) === '3') stackPenalty(room, rank(card), rank(card) === '2' ? 2 : 3);
-  if (checkWin(room, me, rank(card))) { sendGame(room); return; }
+  if (checkWin(room, me, rank(card))) { sendGameAndArm(room); return; }
   nextTurn(room);
-  sendGame(room);
+  sendGameAndArm(room);
 }
 
 function botPlayGroup(room, me, cards) {
@@ -515,9 +515,9 @@ function botPlayGroup(room, me, cards) {
   }
   const last = cards[cards.length - 1];
   if (rank(last) === '2' || rank(last) === '3') stackPenalty(room, rank(last), (rank(last) === '2' ? 2 : 3) * cards.length);
-  if (checkWin(room, me, rank(last))) { sendGame(room); return; }
+  if (checkWin(room, me, rank(last))) { sendGameAndArm(room); return; }
   nextTurn(room);
-  sendGame(room);
+  sendGameAndArm(room);
 }
 
 function botDraw(room, me) {
@@ -528,5 +528,5 @@ function botDraw(room, me) {
     const c = drawOneCard(room); if (c) me.hand.push(c);
   }
   nextTurn(room);
-  sendGame(room);
+  sendGameAndArm(room);
 }
