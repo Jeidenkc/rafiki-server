@@ -487,11 +487,11 @@ function scheduleBotMove(room, botWs, state) {
     }
     console.log('[BOT]', me.name, 'top:', top, 'hand:', me.hand, 'choice:', choice);
     if (choice) {
-      const others = me.hand.filter(c => c !== choice && rank(c) === rank(choice));
+      const others = me.hand.filter(c => c !== choice && rankOf(c) === rankOf(choice));
       if (others.length) {
         botPlayGroup(room, me, [choice, ...others]);
       } else {
-        botPlay(room, me, choice, rank(choice) === 'A' ? suitOf(me.hand.find(c => c !== choice)) || 'H' : null);
+        botPlay(room, me, choice, rankOf(choice) === 'A' ? suitOf(me.hand.find(c => c !== choice)) || 'H' : null);
       }
     } else {
       console.log('[BOT]', me.name, 'drawing, no legal play');
@@ -505,9 +505,9 @@ function botPlay(room, me, card, chosenSuit) {
   if (idx === -1) return;
   me.hand.splice(idx, 1);
   room.pile.push(card);
-  if (rank(card) === 'A' && chosenSuit) room.declaredSuit = chosenSuit; else room.declaredSuit = null;
-  if (rank(card) === '2' || rank(card) === '3') stackPenalty(room, rank(card), rank(card) === '2' ? 2 : 3);
-  if (checkWin(room, me, rank(card))) { sendGameAndArm(room); return; }
+  if (rankOf(card) === 'A' && chosenSuit) room.declaredSuit = chosenSuit; else room.declaredSuit = null;
+  if (rankOf(card) === '2' || rankOf(card) === '3') stackPenalty(room, rankOf(card), rankOf(card) === '2' ? 2 : 3);
+  if (checkWin(room, me, rankOf(card))) { sendGameAndArm(room); return; }
   nextTurn(room);
   sendGameAndArm(room);
 }
@@ -518,8 +518,8 @@ function botPlayGroup(room, me, cards) {
     if (idx !== -1) { me.hand.splice(idx, 1); room.pile.push(c); }
   }
   const last = cards[cards.length - 1];
-  if (rank(last) === '2' || rank(last) === '3') stackPenalty(room, rank(last), (rank(last) === '2' ? 2 : 3) * cards.length);
-  if (checkWin(room, me, rank(last))) { sendGameAndArm(room); return; }
+  if (rankOf(last) === '2' || rankOf(last) === '3') stackPenalty(room, rankOf(last), (rankOf(last) === '2' ? 2 : 3) * cards.length);
+  if (checkWin(room, me, rankOf(last))) { sendGameAndArm(room); return; }
   nextTurn(room);
   sendGameAndArm(room);
 }
