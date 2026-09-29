@@ -473,29 +473,36 @@ function addBot(room) {
 function scheduleBotMove(room, botWs, state) {
   if (room.winner || !room.started) return;
   const me = room.players.find(p => p.ws === botWs);
-  console.log('[BOT]', state.turn, 'vs', me && me.name, 'gate:', !!me && state.turn === (me && me.name));
   if (!me || state.turn !== me.name) return;
-  const delay = 1000 + Math.random() * 2000;
-  console.log('[BOT] scheduled move for', me.name, 'in', Math.round(delay), 'ms');
+  if (botWs.pending) return;
+  botWs.pending = true;
+  const delay = 500 + Math.random() * 900;
   setTimeout(() => {
-    if (room.winner || !room.started) return;
-    if (room.players[room.turn] !== me) { console.log('[BOT] stale timer, turn moved on'); return; }
-    const top = room.pile[room.pile.length - 1];
-    let choice = null;
-    for (const c of me.hand) {
-      if (canPlayServer(room, c, top)) { choice = c; break; }
-    }
-    console.log('[BOT]', me.name, 'top:', top, 'hand:', me.hand, 'choice:', choice);
-    if (choice) {
-      const others = me.hand.filter(c => c !== choice && rankOf(c) === rankOf(choice));
-      if (others.length) {
-        botPlayGroup(room, me, [choice, ...others]);
-      } else {
-        botPlay(room, me, choice, rankOf(choice) === 'A' ? suitOf(me.hand.find(c => c !== choice)) || 'H' : null);
+    botWs.pending = false;
+    try {
+      if (room.winner || !room.started) return;
+      if (room.players[room.turn] !== me) return;
+      const top = room.pile[room.pile.length - 1];
+      let choice = null;
+      for (const c of me.hand) {
+        if (canPlayServer(room, c, top)) { choice = c; break; }
       }
-    } else {
-      console.log('[BOT]', me.name, 'drawing, no legal play');
-      botDraw(room, me);
+      if (choice) {
+        const others = me.hand.filter(c => c !== choice && rankOf(c) === rankOf(choice));
+        if (others.length) {
+          botPlayGroup(room, me, [choice, ...others]);
+        } else {
+          const chosenSuit = rankOf(choice) === 'A'
+            ? (suitOf(me.hand.find(c => c !== choice)) || 'H')
+            : null;
+          botPlay(room, me, choice, chosenSuit);
+        }
+      } else {
+        botDraw(room, me);
+      }
+    } catch (e) {
+      console.error('[BOT] error during move, drawing as fallback:', e);
+      try { botDraw(room, me); } catch (e2) { console.error('[BOT] fallback draw failed:', e2); }
     }
   }, delay);
 }
