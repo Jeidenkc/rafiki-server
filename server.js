@@ -457,7 +457,7 @@ function addBot(room) {
   let botNum = 1;
   while (room.players.some(p => p.name === 'Kadi Bot' + (botNum > 1 ? ' ' + botNum : ''))) botNum++;
   const botName = 'Kadi Bot' + (botNum > 1 ? ' ' + botNum : '');
-  const botWs = { isBot: true, sent: [] };
+  const botWs = { isBot: true, sent: [], readyState: 1 };
   botWs.send = (raw) => {
     try {
       const m = JSON.parse(raw);
