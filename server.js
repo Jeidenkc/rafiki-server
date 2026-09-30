@@ -476,7 +476,7 @@ function scheduleBotMove(room, botWs, state) {
   if (!me || state.turn !== me.name) return;
   if (botWs.pending) return;
   botWs.pending = true;
-  const delay = 500 + Math.random() * 900;
+  const delay = 3000 + Math.random() * 1000;
   setTimeout(() => {
     botWs.pending = false;
     try {
