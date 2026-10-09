@@ -1,2 +1,6 @@
 node_modules/
 server.log
+local.properties
+build
+balances.json
+node_modules

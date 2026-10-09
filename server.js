@@ -1,4 +1,6 @@
 const { WebSocketServer } = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3001;
 const ALLOWED_SIZES = [2, 3, 4];
@@ -7,9 +9,44 @@ const SUITS = ['S', 'H', 'D', 'C'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const WINNING_RANKS = ['4', '5', '6', '7', '9', '10']; // only these can finish a hand
 const SKIP_START = ['2', '3', 'J', 'A']; // these can't be the opening pile card
+const ENTRY_FEE = 10; // NETCOINS charged to each human when a game starts (1 sh = 10 NETCOINS)
+const STARTING_BALANCE = 1000; // NETCOINS granted to a token the first time the server sees it
+const MATCH_WAIT_MS = 30000; // quick-match: give up after this long and charge nothing
+const MATCH_SIZE = 2; // quick-match pairs two players into a 2-player room
 
 const wss = new WebSocketServer({ port: PORT });
 const rooms = new Map();
+
+// ---------- server-side balances ----------
+// Identity is the token alone; the app never tells us its balance. Map of
+// token -> NETCOINS, persisted to a JSON file (temp file + rename = atomic write).
+const BALANCE_FILE = path.join(__dirname, 'balances.json');
+const BALANCE_TMP = BALANCE_FILE + '.tmp';
+let balances = {};
+try {
+  balances = JSON.parse(fs.readFileSync(BALANCE_FILE, 'utf8')) || {};
+} catch (e) {
+  balances = {};
+}
+function saveBalances() {
+  fs.writeFileSync(BALANCE_TMP, JSON.stringify(balances, null, 2));
+  fs.renameSync(BALANCE_TMP, BALANCE_FILE);
+}
+function hasBalance(token) {
+  return Object.prototype.hasOwnProperty.call(balances, token);
+}
+// Register a token on first sight (starting balance), then return its balance.
+function accountFor(token) {
+  if (!hasBalance(token)) { balances[token] = STARTING_BALANCE; saveBalances(); }
+  return balances[token];
+}
+function balanceOf(token) {
+  return hasBalance(token) ? balances[token] : 0;
+}
+function credit(token, amount) {
+  balances[token] = balanceOf(token) + amount;
+  saveBalances();
+}
 
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -34,6 +71,9 @@ function newDeck() {
   return shuffle(d);
 }
 
+function isHuman(p) { return !(p.ws && p.ws.isBot); }
+function humanCount(room) { return room.players.filter(isHuman).length; }
+
 function roomState(room) {
   return {
     type: 'room',
@@ -42,7 +82,9 @@ function roomState(room) {
     players: room.players.map(p => p.name),
     max: room.max,
     waitingFor: room.max - room.players.length,
-    started: room.started
+    started: room.started,
+    entry: ENTRY_FEE,
+    pot: humanCount(room) * ENTRY_FEE
   };
 }
 function broadcast(room) {
@@ -60,6 +102,7 @@ function makeCode() {
 // ---------- game ----------
 function startGame(room) {
   room.started = true;
+  room.settled = false;
   room.deck = newDeck();
   room.pile = [];
   room.dir = 1;
@@ -103,7 +146,10 @@ function sendGame(room) {
       winner: room.winner,
       pendingPenalty: room.pendingPenalty,
       pendingPenaltyRank: room.pendingPenaltyRank,
-      declaredSuit: room.declaredSuit
+      declaredSuit: room.declaredSuit,
+      entry: room.entry || 0,
+      pot: room.pot || 0,
+      balance: isHuman(p) ? balanceOf(p.token) : null
     });
   });
 }
@@ -195,6 +241,24 @@ function applyCardEffect(room, me, card, chosenSuit, previousTop) {
   }
 }
 
+function resolveJackGroup(room, jumps) {
+  let remaining = Math.min(jumps, room.players.length - 1);
+  nextTurn(room);
+  while (remaining > 0) {
+    const candidate = room.players[room.turn];
+    const idx = candidate.hand.findIndex(c => rankOf(c) === 'J');
+    if (idx !== -1) {
+      const escapeJack = candidate.hand.splice(idx, 1)[0];
+      room.pile.push(escapeJack);
+      if (checkWin(room, candidate, 'J')) return;
+      nextTurn(room);
+    } else {
+      nextTurn(room);
+      remaining--;
+    }
+  }
+}
+
 function resolveJack(room) {
   nextTurn(room);
   while (true) {
@@ -212,11 +276,52 @@ function resolveJack(room) {
   }
 }
 
+function settle(room) {
+  if (room.settled || !room.winner) return;
+  room.settled = true;
+  const w = room.players.find(p => p.name === room.winner);
+  // Only a human winner is paid; if a bot wins (or the winner already left) the
+  // escrowed entries stay spent, matching "a loser loses the entry". The settled
+  // guard makes this the single payout for the game.
+  if (w && isHuman(w) && w.token) credit(w.token, room.pot);
+}
+
 function startIfFull(room) {
   if (room.started || room.players.length < room.max) return;
+
+  // Charge the entry on every human. Refuse to start if any cannot pay, and drop
+  // them from the room so the remaining players fall back to the lobby.
+  const humans = room.players.filter(isHuman);
+  const broke = humans.filter(p => balanceOf(p.token) < ENTRY_FEE);
+  if (broke.length) {
+    broke.forEach(p => {
+      err(p.ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+      p.ws.room = null;
+    });
+    room.players = room.players.filter(p => !broke.includes(p));
+    if (room.players.length === 0) { rooms.delete(room.code); return; }
+    broadcast(room);
+    return;
+  }
+
+  // Escrow atomically: affordability is verified for everyone above, then every
+  // human is debited and the file is written once (no interleaving in Node).
+  room.entry = ENTRY_FEE;
+  room.pot = humans.length * ENTRY_FEE;
+  room.paid = true;
+  humans.forEach(p => { balances[p.token] -= ENTRY_FEE; });
+  saveBalances();
+
   startGame(room);
   const players = room.players.map(p => p.name);
-  room.players.forEach(p => send(p.ws, { type: 'started', code: room.code, players }));
+  room.players.forEach(p => send(p.ws, {
+    type: 'started',
+    code: room.code,
+    players,
+    entry: room.entry,
+    pot: room.pot,
+    balance: isHuman(p) ? balanceOf(p.token) : null
+  }));
   sendGameAndArm(room);
 }
 
@@ -224,8 +329,13 @@ function leave(ws) {
   const room = ws.room;
   if (!room) return;
   const idx = room.players.findIndex(p => p.ws === ws);
+  const leaver = idx !== -1 ? room.players[idx] : null;
   if (idx !== -1) room.players.splice(idx, 1);
   ws.room = null;
+  // Escrow is only refunded while the game has not started. Once it is under way
+  // the entry is spent (leaving loses the entry), and a finished game never pays
+  // twice because settle() is guarded by room.settled.
+  if (leaver && leaver.token && room.paid && !room.started) credit(leaver.token, ENTRY_FEE);
   if (room.players.length === 0) {
     disarmTurn(room); rooms.delete(room.code);
     return;
@@ -243,6 +353,76 @@ function leave(ws) {
   if (idx < room.turn) room.turn--;
   if (room.turn >= room.players.length) room.turn = 0;
   sendGameAndArm(room);
+}
+
+// ---------- AUTOMATCH (quick match) ----------
+// Waiting players are held in a queue keyed by token. A queued socket is removed
+// if it disconnects or cancels, and a waiter that is never matched within
+// MATCH_WAIT_MS is told "no match found" and charged nothing. Nothing is charged
+// until a match is actually found; only the display name travels with a request.
+const queue = [];
+
+function inQueue(ws) { return queue.some(e => e.ws === ws); }
+
+function dropFromQueue(ws) {
+  const i = queue.findIndex(e => e.ws === ws);
+  if (i === -1) return null;
+  const [entry] = queue.splice(i, 1);
+  clearTimeout(entry.timer);
+  return entry;
+}
+
+function automatch(token, name, ws) {
+  if (ws.room) return err(ws, 'You are already in a room');
+  if (inQueue(ws) || queue.some(e => e.token === token))
+    return err(ws, 'You are already in the queue');
+  const entry = { token, name, ws };
+  entry.timer = setTimeout(() => {
+    const i = queue.indexOf(entry);
+    if (i === -1) return;
+    queue.splice(i, 1);
+    send(ws, { type: 'matchTimeout', message: 'No match found' });
+  }, MATCH_WAIT_MS);
+  queue.push(entry);
+  send(ws, { type: 'matchQueued', waiting: queue.length });
+  tryMatch();
+}
+
+function tryMatch() {
+  // Every entry is a distinct token, so a grouped pair can never be the same
+  // player twice. Players who cannot pay are dropped from the queue instead.
+  while (queue.length >= MATCH_SIZE) {
+    const group = queue.slice(0, MATCH_SIZE);
+    const broke = group.filter(e => balanceOf(e.token) < ENTRY_FEE);
+    if (broke.length) {
+      broke.forEach(e => {
+        const i = queue.indexOf(e);
+        if (i !== -1) queue.splice(i, 1);
+        clearTimeout(e.timer);
+        err(e.ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+      });
+      continue;
+    }
+    group.forEach(e => { queue.splice(queue.indexOf(e), 1); clearTimeout(e.timer); });
+    openMatchedRoom(group);
+  }
+}
+
+function uniqueName(room, name) {
+  let n = name, i = 2;
+  while (room.players.some(p => p.name === n)) n = name + ' ' + i++;
+  return n;
+}
+
+function openMatchedRoom(group) {
+  const room = { code: makeCode(), max: group.length, players: [], started: false };
+  group.forEach(e => {
+    room.players.push({ name: uniqueName(room, e.name), ws: e.ws, token: e.token });
+    e.ws.room = room;
+  });
+  rooms.set(room.code, room);
+  broadcast(room);
+  startIfFull(room); // escrows the entry and starts the game
 }
 
 wss.on('connection', ws => {
@@ -264,7 +444,11 @@ wss.on('connection', ws => {
         if (!name) return err(ws, 'Enter your name');
         const max = Number(msg.max);
         if (!ALLOWED_SIZES.includes(max)) return err(ws, 'Choose 2, 3 or 4 players');
-        const room = { code: makeCode(), max, players: [{ name, ws }], started: false };
+        const token = String(msg.token || '').trim();
+        if (!token) return err(ws, 'Authentication required');
+        if (accountFor(token) < ENTRY_FEE)
+          return err(ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+        const room = { code: makeCode(), max, players: [{ name, ws, token }], started: false };
         rooms.set(room.code, room);
         ws.room = room;
         broadcast(room);
@@ -280,7 +464,11 @@ wss.on('connection', ws => {
         if (room.players.length >= room.max) return err(ws, 'Room is full');
         if (room.players.some(p => p.name.toLowerCase() === name.toLowerCase()))
           return err(ws, 'That name is taken in this room');
-        room.players.push({ name, ws });
+        const token = String(msg.token || '').trim();
+        if (!token) return err(ws, 'Authentication required');
+        if (accountFor(token) < ENTRY_FEE)
+          return err(ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+        room.players.push({ name, ws, token });
         ws.room = room;
         broadcast(room);
         startIfFull(room);
@@ -320,7 +508,7 @@ wss.on('connection', ws => {
           if (me.hand.indexOf(c) === -1) return err(ws, 'You do not have that card');
         }
         const rank = rankOf(cards[0]);
-        if (rank === 'A' || rank === 'J') return err(ws, 'That rank cannot be grouped');
+        if (rank === 'A') return err(ws, 'That rank cannot be grouped');
         if (!cards.every(c => rankOf(c) === rank)) return err(ws, 'All cards must be the same rank');
 
         let simTop = room.pile[room.pile.length - 1];
@@ -368,7 +556,9 @@ wss.on('connection', ws => {
         if (rank === 'K') {
     // odd number of Ks reverses once; an even number cancels out and the same player plays again
     if (cards.length % 2 === 1) { room.dir = -room.dir; nextTurn(room); }
-  } else if (rank === '8' || rank === 'Q') {
+  } else if (rank === 'J') {
+        resolveJackGroup(room, cards.length);
+      } else if (rank === '8' || rank === 'Q') {
     // extra turn - no advance
   } else {
     nextTurn(room);
@@ -405,12 +595,26 @@ wss.on('connection', ws => {
         send(ws, { type: 'left' });
         break;
       }
+      case 'automatch': {
+        if (!name) return err(ws, 'Enter your name');
+        const token = String(msg.token || '').trim();
+        if (!token) return err(ws, 'Authentication required');
+        if (accountFor(token) < ENTRY_FEE)
+          return err(ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+        automatch(token, name, ws);
+        break;
+      }
+      case 'cancelMatch': {
+        if (dropFromQueue(ws)) send(ws, { type: 'matchCancelled' });
+        else err(ws, 'You are not in the queue');
+        break;
+      }
       default:
         err(ws, 'Unknown action');
     }
   });
 
-  ws.on('close', () => leave(ws));
+  ws.on('close', () => { dropFromQueue(ws); leave(ws); });
 });
 
 console.log('RAFIKI PLAY server running on port ' + PORT);
@@ -446,6 +650,7 @@ function armTurn(room) {
 }
 
 function sendGameAndArm(room) {
+  settle(room);
   sendGame(room);
   if (room.winner) disarmTurn(room);
   else armTurn(room);
