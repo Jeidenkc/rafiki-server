@@ -921,12 +921,21 @@ wss.on('connection', ws => {
           send(tws, {
             type: 'invite',
             from: ws.accountName || 'A friend',
+            fromPhone: ws.phone,
             code: room.code,
             max: room.max,
             entry: ENTRY_FEE
           });
           send(ws, { type: 'inviteSent', name: f.name });
         });
+        break;
+      }
+      case 'inviteReply': {
+        if (!ws.phone) return err(ws, 'Not signed in');
+        const to = online.get(String(msg.to || '').trim());
+        if (to && to.readyState === 1) {
+          send(to, { type: 'inviteReply', name: ws.accountName || 'Your friend', accepted: !!msg.accepted });
+        }
         break;
       }
       case 'tierCounts': {
