@@ -9,10 +9,14 @@ const SUITS = ['S', 'H', 'D', 'C'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const WINNING_RANKS = ['4', '5', '6', '7', '9', '10']; // only these can finish a hand
 const SKIP_START = ['2', '3', 'J', 'A']; // these can't be the opening pile card
-const ENTRY_FEE = 10; // NETCOINS charged to each human when a game starts (1 sh = 10 NETCOINS)
+const ENTRY_FEE = 10; // NETCOINS charged to each human when a Create Room / Add Bot game starts (1 sh = 10 NETCOINS)
 const STARTING_BALANCE = 1000; // NETCOINS granted to a token the first time the server sees it
-const MATCH_WAIT_MS = 30000; // quick-match: give up after this long and charge nothing
-const MATCH_SIZE = 2; // quick-match pairs two players into a 2-player room
+const STAKE_TIERS = [100, 200, 500, 1000]; // AUTOMATCH stake tiers, in NETCOINS (1 sh = 10 NETCOINS)
+const FEE_PERCENT = 10; // AUTOMATCH: fee per player, as a percent of the stake
+const MATCH_SIZE = 2; // AUTOMATCH pairs two players into a 2-player room
+const MATCH_WAIT_MS = 10 * 60 * 1000; // a queued player waits this long before "no match found" (10 min)
+const ACCEPT_WINDOW_MS = 30000; // both players get this long to accept a found match (30 s)
+const DISCONNECT_GRACE_MS = 60000; // a disconnected waiter is dropped after this long (60 s)
 
 const wss = new WebSocketServer({ port: PORT });
 const rooms = new Map();
@@ -47,6 +51,10 @@ function credit(token, amount) {
   balances[token] = balanceOf(token) + amount;
   saveBalances();
 }
+
+// Running total of AUTOMATCH fees collected on this server instance (fees are a
+// slice of each pot that is never paid out to the winner).
+let totalFees = 0;
 
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -83,8 +91,8 @@ function roomState(room) {
     max: room.max,
     waitingFor: room.max - room.players.length,
     started: room.started,
-    entry: ENTRY_FEE,
-    pot: humanCount(room) * ENTRY_FEE
+    entry: room.entry != null ? room.entry : ENTRY_FEE,
+    pot: room.pot != null ? room.pot : humanCount(room) * ENTRY_FEE
   };
 }
 function broadcast(room) {
@@ -281,9 +289,10 @@ function settle(room) {
   room.settled = true;
   const w = room.players.find(p => p.name === room.winner);
   // Only a human winner is paid; if a bot wins (or the winner already left) the
-  // escrowed entries stay spent, matching "a loser loses the entry". The settled
-  // guard makes this the single payout for the game.
-  if (w && isHuman(w) && w.token) credit(w.token, room.pot);
+  // escrowed stakes stay spent. AUTOMATCH rooms carry an explicit winAmount (pot
+  // minus both fees); Create Room / Add Bot rooms pay the whole pot as before.
+  // The settled guard makes this the single payout for the game.
+  if (w && isHuman(w) && w.token) credit(w.token, room.winAmount != null ? room.winAmount : room.pot);
 }
 
 function startIfFull(room) {
@@ -355,57 +364,278 @@ function leave(ws) {
   sendGameAndArm(room);
 }
 
-// ---------- AUTOMATCH (quick match) ----------
-// Waiting players are held in a queue keyed by token. A queued socket is removed
-// if it disconnects or cancels, and a waiter that is never matched within
-// MATCH_WAIT_MS is told "no match found" and charged nothing. Nothing is charged
-// until a match is actually found; only the display name travels with a request.
-const queue = [];
+// ---------- AUTOMATCH (quick match, stake tiers) ----------
+// Four fixed stake tiers. A token may sit in at most one tier queue, and a player
+// may only queue for a tier they can afford. A queued player waits MATCH_WAIT_MS
+// (10 min), or until they cancel, or until they have been disconnected for
+// DISCONNECT_GRACE_MS (60 s). When two different players are waiting in the same
+// tier, both are offered the match and must accept within ACCEPT_WINDOW_MS; nothing
+// is charged until both accept. Only the display name is ever passed around.
+const queues = new Map(); // stake -> [entry]
+STAKE_TIERS.forEach(s => queues.set(s, []));
 
-function inQueue(ws) { return queue.some(e => e.ws === ws); }
+const pendingMatches = new Map(); // matchId -> match awaiting accept/decline
 
-function dropFromQueue(ws) {
-  const i = queue.findIndex(e => e.ws === ws);
-  if (i === -1) return null;
-  const [entry] = queue.splice(i, 1);
-  clearTimeout(entry.timer);
-  return entry;
+function feeFor(stake) { return Math.round(stake * FEE_PERCENT / 100); }
+
+// "Users searching" counts only entries whose socket is live, since a disconnected
+// entry (kept for the 60 s grace window) cannot be matched or accept an offer.
+function tierCounts() {
+  return STAKE_TIERS.map(s => ({ stake: s, count: queues.get(s).filter(e => e.ws).length }));
 }
 
-function automatch(token, name, ws) {
-  if (ws.room) return err(ws, 'You are already in a room');
-  if (inQueue(ws) || queue.some(e => e.token === token))
-    return err(ws, 'You are already in the queue');
-  const entry = { token, name, ws };
-  entry.timer = setTimeout(() => {
-    const i = queue.indexOf(entry);
-    if (i === -1) return;
-    queue.splice(i, 1);
-    send(ws, { type: 'matchTimeout', message: 'No match found' });
+function broadcastTierCounts() {
+  const msg = { type: 'tierCounts', tiers: tierCounts() };
+  wss.clients.forEach(c => {
+    if (c.readyState === 1 && (!c.room || !c.room.started)) send(c, msg);
+  });
+}
+
+function findEntry(token) {
+  for (const s of STAKE_TIERS) {
+    const e = queues.get(s).find(x => x.token === token);
+    if (e) return e;
+  }
+  return null;
+}
+
+// A token already seated in any room (waiting or playing) must not be able to
+// queue for a tier from another socket, or it could be dealt into two games.
+function tokenInAnyRoom(token) {
+  for (const room of rooms.values()) {
+    if (room.players.some(p => p.token === token)) return true;
+  }
+  return false;
+}
+
+function removeEntry(entry) {
+  const list = queues.get(entry.stake);
+  if (!list) return false;
+  const i = list.indexOf(entry);
+  if (i === -1) return false;
+  list.splice(i, 1);
+  clearTimeout(entry.waitTimer);
+  clearTimeout(entry.disconnectTimer);
+  return true;
+}
+
+function armWaitTimer(entry) {
+  clearTimeout(entry.waitTimer);
+  entry.waitTimer = setTimeout(() => {
+    if (removeEntry(entry)) {
+      if (entry.ws) send(entry.ws, { type: 'matchTimeout', message: 'No match found' });
+      broadcastTierCounts();
+    }
   }, MATCH_WAIT_MS);
-  queue.push(entry);
-  send(ws, { type: 'matchQueued', waiting: queue.length });
-  tryMatch();
 }
 
-function tryMatch() {
-  // Every entry is a distinct token, so a grouped pair can never be the same
-  // player twice. Players who cannot pay are dropped from the queue instead.
-  while (queue.length >= MATCH_SIZE) {
-    const group = queue.slice(0, MATCH_SIZE);
-    const broke = group.filter(e => balanceOf(e.token) < ENTRY_FEE);
+function automatch(token, name, ws, stake) {
+  if (ws.room) return err(ws, 'You are already in a room');
+  if (tokenInAnyRoom(token)) return err(ws, 'You are already in a game');
+  const existing = findEntry(token);
+  if (existing) {
+    if (existing.ws) return err(ws, 'You are already in a queue');
+    // Reconnect within the grace window: keep the original tier and queue position.
+    clearTimeout(existing.disconnectTimer);
+    existing.ws = ws;
+    existing.name = name;
+    send(ws, { type: 'matchQueued', stake: existing.stake });
+    broadcastTierCounts();
+    tryMatch(existing.stake);
+    return;
+  }
+  const entry = { token, name, ws, stake };
+  armWaitTimer(entry);
+  queues.get(stake).push(entry);
+  send(ws, { type: 'matchQueued', stake });
+  broadcastTierCounts();
+  tryMatch(stake);
+}
+
+// Put a player who accepted a failed offer back at the FRONT of their tier queue.
+function enqueueFront(entry) {
+  const list = queues.get(entry.stake);
+  if (!list || list.includes(entry)) return;
+  list.unshift(entry);
+  armWaitTimer(entry);
+  send(entry.ws, { type: 'matchQueued', stake: entry.stake });
+  broadcastTierCounts();
+  tryMatch(entry.stake);
+}
+
+function tryMatch(stake) {
+  const list = queues.get(stake);
+  if (!list) return;
+  // Live entries are already distinct tokens (one entry per token), so a formed
+  // pair can never be the same player twice.
+  while (true) {
+    const live = list.filter(e => e.ws);
+    if (live.length < MATCH_SIZE) return;
+    const pair = live.slice(0, MATCH_SIZE);
+    const broke = pair.filter(e => balanceOf(e.token) < stake);
     if (broke.length) {
       broke.forEach(e => {
-        const i = queue.indexOf(e);
-        if (i !== -1) queue.splice(i, 1);
-        clearTimeout(e.timer);
-        err(e.ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
+        removeEntry(e);
+        err(e.ws, 'Not enough NETCOINS for the ' + stake + ' NETCOIN tier');
       });
+      broadcastTierCounts();
       continue;
     }
-    group.forEach(e => { queue.splice(queue.indexOf(e), 1); clearTimeout(e.timer); });
-    openMatchedRoom(group);
+    pair.forEach(removeEntry);
+    broadcastTierCounts();
+    beginNegotiation(stake, pair[0], pair[1]);
   }
+}
+
+function makeMatchId() {
+  let id;
+  do {
+    id = '';
+    for (let i = 0; i < 6; i++) id += CHARS[Math.floor(Math.random() * CHARS.length)];
+  } while (pendingMatches.has(id));
+  return id;
+}
+
+// Offer the match. Nothing is charged yet: both players must accept within
+// ACCEPT_WINDOW_MS, after which the stakes are escrowed and the game starts.
+function beginNegotiation(stake, a, b) {
+  const fee = feeFor(stake);
+  const pot = stake * MATCH_SIZE;
+  const match = {
+    id: makeMatchId(),
+    stake,
+    fee,
+    pot,
+    winAmount: pot - fee * MATCH_SIZE,
+    entries: [a, b],
+    accepted: new Set(),
+    done: false,
+    timer: null
+  };
+  a.match = b.match = match;
+  a.ws.match = b.ws.match = match;
+  pendingMatches.set(match.id, match);
+  match.timer = setTimeout(() => finishMatch(match, 'timeout'), ACCEPT_WINDOW_MS);
+  [a, b].forEach(e => send(e.ws, {
+    type: 'matchFound',
+    matchId: match.id,
+    stake,
+    fee,
+    winAmount: match.winAmount
+  }));
+}
+
+function acceptMatch(ws, matchId) {
+  const match = pendingMatches.get(matchId);
+  if (!match || match.done) return err(ws, 'That match is no longer available');
+  const entry = match.entries.find(e => e.ws === ws);
+  if (!entry) return err(ws, 'That is not your match');
+  if (match.accepted.has(entry.token)) return;
+  match.accepted.add(entry.token);
+  send(ws, { type: 'matchAccepted', matchId: match.id });
+  if (match.accepted.size === match.entries.length) startNegotiatedMatch(match);
+}
+
+function declineMatch(ws, matchId) {
+  const match = pendingMatches.get(matchId);
+  if (!match || match.done) return err(ws, 'That match is no longer available');
+  const entry = match.entries.find(e => e.ws === ws);
+  if (!entry) return err(ws, 'That is not your match');
+  finishMatch(match, 'declined');
+}
+
+// Offer failed (decline, timeout, or disconnect): nobody is charged. Whoever
+// accepted goes back to the front of their tier; whoever didn't is dropped.
+function finishMatch(match, reason) {
+  if (match.done) return;
+  match.done = true;
+  clearTimeout(match.timer);
+  pendingMatches.delete(match.id);
+
+  const accepted = [];
+  const removed = [];
+  match.entries.forEach(e => {
+    if (e.ws) e.ws.match = null;
+    e.match = null;
+    (match.accepted.has(e.token) && e.ws ? accepted : removed).push(e);
+  });
+
+  removed.forEach(e => {
+    if (e.ws) send(e.ws, { type: 'matchEnded', matchId: match.id, reason, requeued: false });
+  });
+  accepted.forEach(e => {
+    send(e.ws, { type: 'matchEnded', matchId: match.id, reason, requeued: true });
+    enqueueFront(e);
+  });
+  broadcastTierCounts();
+}
+
+function startNegotiatedMatch(match) {
+  if (match.done) return;
+  const { stake, fee } = match;
+
+  // Re-check affordability before charging so escrow can never half-complete.
+  if (match.entries.some(e => !e.ws || balanceOf(e.token) < stake)) {
+    finishMatch(match, 'insufficient');
+    return;
+  }
+
+  match.done = true;
+  clearTimeout(match.timer);
+  pendingMatches.delete(match.id);
+
+  // Escrow atomically: both verified, debit both, single file write.
+  match.entries.forEach(e => { balances[e.token] -= stake; });
+  totalFees += fee * MATCH_SIZE;
+  saveBalances();
+
+  const room = {
+    code: makeCode(),
+    max: MATCH_SIZE,
+    players: [],
+    started: false,
+    entry: stake,
+    stake,
+    fee,
+    pot: stake * MATCH_SIZE,
+    winAmount: stake * MATCH_SIZE - fee * MATCH_SIZE,
+    paid: true
+  };
+  match.entries.forEach(e => {
+    e.ws.match = null;
+    e.match = null;
+    room.players.push({ name: uniqueName(room, e.name), ws: e.ws, token: e.token });
+    e.ws.room = room;
+  });
+  rooms.set(room.code, room);
+
+  startGame(room);
+  const players = room.players.map(p => p.name);
+  room.players.forEach(p => send(p.ws, {
+    type: 'started',
+    code: room.code,
+    players,
+    entry: room.entry,
+    pot: room.pot,
+    balance: balanceOf(p.token)
+  }));
+  sendGameAndArm(room);
+  broadcastTierCounts();
+}
+
+// A socket that drops while queued is held for DISCONNECT_GRACE_MS so a quick
+// reconnect does not lose the player's place; after that it leaves the queue.
+function handleDisconnect(ws) {
+  STAKE_TIERS.forEach(s => {
+    queues.get(s).forEach(e => {
+      if (e.ws !== ws) return;
+      e.ws = null;
+      e.disconnectTimer = setTimeout(() => {
+        if (!e.ws && removeEntry(e)) broadcastTierCounts();
+      }, DISCONNECT_GRACE_MS);
+    });
+  });
+  broadcastTierCounts();
 }
 
 function uniqueName(room, name) {
@@ -414,15 +644,41 @@ function uniqueName(room, name) {
   return n;
 }
 
-function openMatchedRoom(group) {
-  const room = { code: makeCode(), max: group.length, players: [], started: false };
-  group.forEach(e => {
-    room.players.push({ name: uniqueName(room, e.name), ws: e.ws, token: e.token });
-    e.ws.room = room;
+// ---------- FRIENDS (accounts live in kib-server) ----------
+const KIB_URL = process.env.KIB_URL || 'https://kib-server.onrender.com';
+const online = new Map(); // phone -> ws
+
+async function kibGet(pathname, token) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const r = await fetch(KIB_URL + pathname, {
+      headers: { Authorization: 'Bearer ' + token },
+      signal: ctrl.signal
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isOnline(phone) {
+  const w = online.get(phone);
+  return !!(w && w.readyState === 1);
+}
+
+async function sendFriends(ws) {
+  if (!ws.kibToken) return err(ws, 'Not signed in');
+  const d = await kibGet('/friends', ws.kibToken);
+  if (!d) return err(ws, 'Could not load friends');
+  send(ws, {
+    type: 'friends',
+    friends: d.friends.map(f => ({ phone: f.phone, name: f.name, online: isOnline(f.phone) })),
+    requests: d.requests
   });
-  rooms.set(room.code, room);
-  broadcast(room);
-  startIfFull(room); // escrows the entry and starts the game
 }
 
 wss.on('connection', ws => {
@@ -599,14 +855,82 @@ wss.on('connection', ws => {
         if (!name) return err(ws, 'Enter your name');
         const token = String(msg.token || '').trim();
         if (!token) return err(ws, 'Authentication required');
-        if (accountFor(token) < ENTRY_FEE)
-          return err(ws, 'Not enough NETCOINS to play (' + ENTRY_FEE + ' required)');
-        automatch(token, name, ws);
+        const stake = Number(msg.stake);
+        if (!STAKE_TIERS.includes(stake))
+          return err(ws, 'Choose a stake of ' + STAKE_TIERS.join(', ') + ' NETCOINS');
+        if (accountFor(token) < stake)
+          return err(ws, 'Not enough NETCOINS for the ' + stake + ' NETCOIN tier');
+        automatch(token, name, ws, stake);
         break;
       }
       case 'cancelMatch': {
-        if (dropFromQueue(ws)) send(ws, { type: 'matchCancelled' });
-        else err(ws, 'You are not in the queue');
+        const entry = findEntry(String(msg.token || '').trim());
+        if (entry && entry.ws === ws) {
+          removeEntry(entry);
+          send(ws, { type: 'matchCancelled' });
+          broadcastTierCounts();
+        } else {
+          err(ws, 'You are not in the queue');
+        }
+        break;
+      }
+      case 'acceptMatch': {
+        acceptMatch(ws, String(msg.matchId || ''));
+        break;
+      }
+      case 'declineMatch': {
+        declineMatch(ws, String(msg.matchId || ''));
+        break;
+      }
+      case 'hello': {
+        const token = String(msg.token || '').trim();
+        if (!token) return err(ws, 'Authentication required');
+        kibGet('/me', token).then(me => {
+          if (!me || !me.phone) return err(ws, 'Login expired. Please log in again');
+          if (ws.phone && online.get(ws.phone) === ws) online.delete(ws.phone);
+          ws.kibToken = token;
+          ws.phone = me.phone;
+          ws.accountName = me.name;
+          online.set(me.phone, ws);
+          send(ws, { type: 'hello', phone: me.phone, name: me.name });
+          sendFriends(ws);
+        });
+        break;
+      }
+      case 'friends': {
+        sendFriends(ws);
+        break;
+      }
+      case 'invite': {
+        if (!ws.phone) return err(ws, 'Not signed in');
+        const room = ws.room;
+        if (!room || room.started) return err(ws, 'Create a room first');
+        if (room.players.length >= room.max) return err(ws, 'Room is full');
+        const now = Date.now();
+        if (ws.lastInvite && now - ws.lastInvite < 3000) return err(ws, 'Wait a moment before inviting again');
+        ws.lastInvite = now;
+        const target = String(msg.phone || '').trim();
+        kibGet('/friends', ws.kibToken).then(d => {
+          const f = d && d.friends.find(x => x.phone === target);
+          if (!f) return err(ws, 'That player is not your friend');
+          if (ws.room !== room || room.started || room.players.length >= room.max)
+            return err(ws, 'Room is no longer open');
+          const tws = online.get(target);
+          if (!tws || tws.readyState !== 1) return err(ws, 'Your friend is offline');
+          if (tws.room) return err(ws, 'Your friend is already in a room');
+          send(tws, {
+            type: 'invite',
+            from: ws.accountName || 'A friend',
+            code: room.code,
+            max: room.max,
+            entry: ENTRY_FEE
+          });
+          send(ws, { type: 'inviteSent', name: f.name });
+        });
+        break;
+      }
+      case 'tierCounts': {
+        send(ws, { type: 'tierCounts', tiers: tierCounts() });
         break;
       }
       default:
@@ -614,7 +938,12 @@ wss.on('connection', ws => {
     }
   });
 
-  ws.on('close', () => { dropFromQueue(ws); leave(ws); });
+  ws.on('close', () => {
+    if (ws.phone && online.get(ws.phone) === ws) online.delete(ws.phone);
+    if (ws.match) finishMatch(ws.match, 'disconnected');
+    handleDisconnect(ws);
+    leave(ws);
+  });
 });
 
 console.log('RAFIKI PLAY server running on port ' + PORT);
